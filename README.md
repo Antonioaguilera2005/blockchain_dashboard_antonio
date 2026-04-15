@@ -7,10 +7,10 @@ Update this README every week.
 
 | Field | Value |
 |---|---|
-| Student Name | | Antonio Aguilera Slavcheva
-| GitHub Username | | Antonioaguilera2005
-| Project Title | | Blockchain_dashboard_Antonio
-| Chosen AI Approach | | Predictor
+| Student Name | | Antonio Aguilera Slavcheva |
+| GitHub Username | | Antonioaguilera2005 |
+| Project Title | | Blockchain_dashboard_Antonio |
+| Chosen AI Approach | | Predictor |
 
 ## Module Tracking
 
