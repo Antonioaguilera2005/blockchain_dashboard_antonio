@@ -1,396 +1,286 @@
 """
-M4 · AI Component — Difficulty Predictor
-==========================================
+M4 · AI Component — Block Arrival Anomaly Detector
+=====================================================
 Streamlit module — exposes render() for app.py.
 
-MODEL CHOICE: Facebook Prophet
--------------------------------
-We use Prophet (Taylor & Letham, 2017) for the following reasons:
+MODEL CHOICE: Statistical Anomaly Detection
+--------------------------------------------
+We model inter-block arrival times as an Exponential distribution with
+parameter λ = 1/600 s⁻¹ (one block every 600 seconds on average).
 
-1. The difficulty time series has a clear upward trend with occasional
-   reversals — Prophet models trend changes automatically via changepoints.
+This is the THEORETICAL BASELINE from the course notes:
+  - Miners attempt hashes independently and memorylessly.
+  - The number of attempts follows a Poisson process.
+  - Therefore, the time between events (blocks) follows Exp(λ = 1/600).
 
-2. Difficulty adjustments happen on a fixed schedule (~14 days), making
-   the series regular and well-suited for time-series forecasting.
+ANOMALY DEFINITION
+------------------
+A block is anomalous if its arrival time falls outside the 95th percentile
+of the theoretical Exp(1/600) distribution:
 
-3. Prophet is interpretable: it decomposes the forecast into trend +
-   seasonality components, which we can explain and visualise.
+    threshold_high = -ln(1 - 0.95) / λ = -ln(0.05) × 600 ≈ 1797 s ≈ 30 min
+    threshold_low  = -ln(1 - 0.05) / λ = -ln(0.95) × 600 ≈   31 s
 
-4. Unlike LSTM, Prophet requires no hyperparameter tuning and trains
-   in seconds on small datasets (~80 data points over 3 years).
+WHAT ANOMALIES CAN INDICATE
+-----------------------------
+- Very long intervals (>30 min): hashrate drop, large mining pool going
+  offline, network partition, or natural statistical variance.
+- Very short intervals (<31 s): possible timestamp manipulation, or
+  selfish mining behaviour.
 
-EVALUATION
-----------
-We use a time-series cross-validation approach:
-  - Training set: all points except the last 10
-  - Test set: last 10 adjustment periods (~20 weeks)
-  - Metrics: MAE (Mean Absolute Error) and MAPE (Mean Absolute Percentage Error)
-
-LIMITATIONS (required in the report)
---------------------------------------
-- Prophet assumes the future resembles the past. A sudden hashrate shock
-  (e.g. a country banning mining, a new ASIC generation) would cause a
-  large prediction error.
-- The dataset is small (~80 points over 3 years). More data would help
-  but difficulty only started being significant around 2017.
-- We predict the difficulty value, not the change direction — the latter
-  would require modelling hashrate directly.
+EVALUATION METRICS
+------------------
+- Anomaly rate: % of blocks flagged (expected ~10% under null hypothesis)
+- KS test: how much the observed distribution deviates from Exp(1/600)
+- Mean and std vs theoretical values (μ = σ = 600 s)
 """
 
 from __future__ import annotations
 
-from io import StringIO
+import math
 import time
-from turtle import pd
-from unittest import result
-import warnings
 
 import streamlit as st
 
-warnings.filterwarnings("ignore")  # suppress Prophet/cmdstanpy output
-
-from api.blockchain_client import get_difficulty_history
+from api.blockchain_client import get_block_interval_timestamps
 
 # ---------------------------------------------------------------------------
-# Constants
+# Theoretical Exponential(λ = 1/600) parameters
 # ---------------------------------------------------------------------------
-ADJUSTMENT_PERIOD_DAYS = 14   # one Bitcoin difficulty adjustment ≈ 14 days
-N_FORECAST_PERIODS     = 6    # predict next 6 adjustment periods (~12 weeks)
-N_TEST_PERIODS         = 10   # last 10 periods held out for evaluation
+LAMBDA           = 1 / 600
+MEAN_S           = 600
+STD_S            = 600
+THRESHOLD_HIGH_S = -math.log(1 - 0.95) / LAMBDA   # ≈ 1797 s ≈ 30 min
+THRESHOLD_LOW_S  = -math.log(1 - 0.05) / LAMBDA   # ≈   31 s
 
 
-# ===========================================================================
-# Data helpers
-# ===========================================================================
-
-@st.cache_data(ttl=600)
-def _fetch_history() -> list[dict]:
-    """Fetch full difficulty history (3 years) for model training."""
-    return get_difficulty_history(n_points=150)
+def exp_cdf(x: float) -> float:
+    return 1 - math.exp(-LAMBDA * x)
 
 
-def _prepare_dataframe(history: list[dict]):
-    """Convert history to a pandas DataFrame in Prophet format (ds, y)."""
-    import pandas as pd
-    import numpy as np
-
-    df = pd.DataFrame(history)
-    df["ds"] = pd.to_datetime(df["x"], unit="s")
-    df["y"]  = df["y"].astype(float)
-
-    # Prophet works better on log scale for exponentially growing series
-    df["y_log"] = np.log(df["y"])
-
-    return df.sort_values("ds").reset_index(drop=True)
+def exp_pdf_scaled(x: float, n: int, bin_width: float) -> float:
+    """PDF scaled to histogram counts."""
+    return LAMBDA * math.exp(-LAMBDA * x) * n * bin_width
 
 
-# ===========================================================================
-# Model training and forecasting
-# ===========================================================================
-
-@st.cache_data(ttl=600)
-def _train_and_forecast(history_json: str):
-    """
-    Train Prophet on difficulty history and return forecast + evaluation.
-
-    We pass history as a JSON string so st.cache_data can hash it.
-    """
-    import json
-    import numpy as np
-    import pandas as pd
-    from prophet import Prophet
-
-    history = json.loads(history_json)
-    df = _prepare_dataframe(history)
-
-    if len(df) < N_TEST_PERIODS + 5:
-        return None
-
-    # ------------------------------------------------------------------
-    # Train / test split
-    # ------------------------------------------------------------------
-    train_df = df.iloc[:-N_TEST_PERIODS].copy()
-    test_df  = df.iloc[-N_TEST_PERIODS:].copy()
-
-    # ------------------------------------------------------------------
-    # Train Prophet on log-transformed difficulty
-    # ------------------------------------------------------------------
-    model = Prophet(
-        changepoint_prior_scale=0.3,   # allow moderate trend changes
-        seasonality_mode="additive",
-        daily_seasonality=False,
-        weekly_seasonality=False,
-        yearly_seasonality=False,      # ~26 adjustments/year is too sparse
-        interval_width=0.90,           # 90% confidence interval
+def ks_test(intervals: list[float]) -> tuple[float, float]:
+    """One-sample KS test against Exp(λ=1/600). Returns (statistic, p_value)."""
+    sorted_x = sorted(intervals)
+    n = len(sorted_x)
+    ks_stat = max(
+        abs((i + 1) / n - exp_cdf(x))
+        for i, x in enumerate(sorted_x)
     )
-    model.fit(train_df[["ds", "y_log"]].rename(columns={"y_log": "y"}))
-
-    # ------------------------------------------------------------------
-    # In-sample test: predict the held-out test periods
-    # ------------------------------------------------------------------
-    test_forecast = model.predict(test_df[["ds"]])
-    test_pred_log = test_forecast["yhat"].values
-    test_actual   = test_df["y_log"].values
-
-    # Back-transform from log scale
-    test_pred = np.exp(test_pred_log)
-    test_real = np.exp(test_actual)
-
-    mae  = float(np.mean(np.abs(test_pred - test_real)))
-    mape = float(np.mean(np.abs((test_pred - test_real) / test_real)) * 100)
-
-    # ------------------------------------------------------------------
-    # Retrain on full dataset for future forecast
-    # ------------------------------------------------------------------
-    full_model = Prophet(
-        changepoint_prior_scale=0.3,
-        seasonality_mode="additive",
-        daily_seasonality=False,
-        weekly_seasonality=False,
-        yearly_seasonality=False,
-        interval_width=0.90,
+    t = (n ** 0.5) * ks_stat
+    p_value = 2 * sum(
+        ((-1) ** (k + 1)) * math.exp(-2 * k * k * t * t)
+        for k in range(1, 101)
     )
-    full_model.fit(df[["ds", "y_log"]].rename(columns={"y_log": "y"}))
+    return ks_stat, max(0.0, min(1.0, p_value))
 
-    # Future dataframe: one row per adjustment period
-    future = full_model.make_future_dataframe(
-        periods=N_FORECAST_PERIODS,
-        freq=f"{ADJUSTMENT_PERIOD_DAYS}D",
-    )
-    forecast = full_model.predict(future)
 
-    # Back-transform all forecast values
-    forecast["yhat_actual"]        = np.exp(forecast["yhat"])
-    forecast["yhat_lower_actual"]  = np.exp(forecast["yhat_lower"])
-    forecast["yhat_upper_actual"]  = np.exp(forecast["yhat_upper"])
-
-    return {
-        "df":           df.to_json(),
-        "train_df":     train_df.to_json(),
-        "test_df":      test_df.to_json(),
-        "forecast":     forecast[["ds", "yhat_actual",
-                                   "yhat_lower_actual",
-                                   "yhat_upper_actual"]].to_json(),
-        "test_pred":    test_pred.tolist(),
-        "test_real":    test_real.tolist(),
-        "test_dates":   test_df["ds"].dt.strftime("%Y-%m-%d").tolist(),
-        "mae":          mae,
-        "mape":         mape,
-    }
+def classify(seconds: float) -> str:
+    if seconds > THRESHOLD_HIGH_S:
+        return "🔴 SLOW"
+    if seconds < THRESHOLD_LOW_S:
+        return "🔵 FAST"
+    return "🟢 NORMAL"
 
 
 # ===========================================================================
-# Streamlit render
+# Cached fetch
+# ===========================================================================
+
+@st.cache_data(ttl=120)
+def _fetch_intervals(n_blocks: int) -> list[int]:
+    ts = get_block_interval_timestamps(n_blocks)
+    return [abs(ts[i] - ts[i + 1]) for i in range(len(ts) - 1)]
+
+
+# ===========================================================================
+# Render
 # ===========================================================================
 
 def render() -> None:
-    """Draw the M4 AI Component tab."""
-    import json
     import numpy as np
     import pandas as pd
     import plotly.graph_objects as go
 
-    st.header("M4 · AI Component — Difficulty Predictor")
+    st.header("M4 · AI Component — Block Arrival Anomaly Detector")
     st.caption(
-        "Uses Facebook Prophet to forecast the next Bitcoin difficulty "
-        "adjustments based on historical data."
+        "Detects statistically abnormal inter-block times using the "
+        "theoretical Exponential(λ = 1/600 s⁻¹) baseline from Proof-of-Work theory."
     )
 
-    # ------------------------------------------------------------------
-    # Model info box
-    # ------------------------------------------------------------------
-    with st.expander("ℹ️ About the model", expanded=False):
-        st.markdown("""
-**Model**: Facebook Prophet (Taylor & Letham, 2017)
+    with st.expander("ℹ️ Model & theory", expanded=False):
+        st.markdown(f"""
+**Theoretical baseline**: Under Bitcoin's Proof-of-Work, hash attempts are
+independent and memoryless → blocks arrive via a **Poisson process** →
+inter-block times follow **Exp(λ = 1/600 s⁻¹)** with μ = σ = 600 s.
 
-**Why Prophet?**
-- Bitcoin difficulty follows a clear upward trend with occasional reversals — Prophet handles trend changepoints automatically.
-- Adjustments happen on a fixed ~14-day schedule, making the series regular and predictable.
-- Interpretable: decomposes forecast into trend + components.
-- Trains in seconds on our ~80-point dataset with no hyperparameter tuning.
+**Anomaly thresholds** (two-tailed, 5% per tail):
+- 🔵 **Suspiciously fast**: interval < **{THRESHOLD_LOW_S:.0f} s ({THRESHOLD_LOW_S/60:.1f} min)** — bottom 5%
+- 🔴 **Suspiciously slow**: interval > **{THRESHOLD_HIGH_S:.0f} s ({THRESHOLD_HIGH_S/60:.0f} min)** — top 5%
+- 🟢 **Normal**: central 90%
 
-**Training data**: last 3 years of difficulty adjustments (~78 periods) from mempool.space
+**What anomalies indicate**:
+- Long gaps: hashrate drop, large pool offline, network partition, or natural variance.
+- Short gaps: timestamp manipulation or selfish mining (pool withholds blocks strategically).
 
-**Evaluation**: held-out test set = last 10 adjustment periods (~20 weeks)
-
-**Metrics**: MAE (Mean Absolute Error), MAPE (Mean Absolute Percentage Error)
-
-**Limitations**:
-- Assumes future resembles the past. A sudden hashrate shock (mining ban, new ASIC generation) would cause large errors.
-- Small dataset (~80 points). The model captures trend well but uncertainty grows quickly beyond 3–4 periods.
-- We predict the difficulty *value*, not the direction of change — the latter would require modelling hashrate directly.
+**Evaluation**: anomaly rate should be ~10% under null hypothesis.
+KS test measures deviation from Exp(1/600) — p < 0.05 means significant departure.
         """)
 
     # ------------------------------------------------------------------
-    # Fetch data and train
+    # Controls & fetch
     # ------------------------------------------------------------------
-    with st.spinner("Fetching difficulty history and training Prophet…"):
-        history = _fetch_history()
-        if not history:
-            st.error("Could not fetch difficulty history.")
+    n_blocks = st.slider(
+        "Blocks to analyse", 50, 200, 100, 10, key="m4_slider"
+    )
+
+    with st.spinner(f"Fetching last {n_blocks} block timestamps…"):
+        try:
+            intervals = _fetch_intervals(n_blocks)
+        except Exception as exc:
+            st.error(f"Could not fetch data: {exc}")
             return
-        result = _train_and_forecast(json.dumps(history))
 
-    if result is None:
-        st.error("Not enough data to train the model (need at least 15 adjustment periods).")
-        return
+    ivf    = [float(iv) for iv in intervals]
+    n      = len(ivf)
+    labels = [classify(iv) for iv in ivf]
 
-    from io import StringIO
-    df       = pd.read_json(StringIO(result["df"]))
-    forecast = pd.read_json(StringIO(result["forecast"]))
-    test_df  = pd.read_json(StringIO(result["test_df"]))
+    n_slow  = labels.count("🔴 SLOW")
+    n_fast  = labels.count("🔵 FAST")
+    n_anom  = n_slow + n_fast
+    anom_pct = n_anom / n * 100
 
-    df["ds"]       = pd.to_datetime(df["ds"], unit="ms")
-    forecast["ds"] = pd.to_datetime(forecast["ds"], unit="ms")
-    test_df["ds"]  = pd.to_datetime(test_df["ds"], unit="ms")
-
-    mae  = result["mae"]
-    mape = result["mape"]
+    mean_obs = sum(ivf) / n
+    std_obs  = (sum((x - mean_obs) ** 2 for x in ivf) / n) ** 0.5
+    ks_stat, ks_pval = ks_test(ivf)
 
     # ------------------------------------------------------------------
-    # Section 1 — Forecast chart
+    # Section 1 — Metrics
     # ------------------------------------------------------------------
-    st.subheader("1 · Difficulty forecast (next 6 adjustment periods ≈ 12 weeks)")
+    st.subheader("1 · Statistical summary")
 
-    fig = go.Figure()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Blocks analysed", n)
+    c2.metric("Anomaly rate", f"{anom_pct:.1f}%", help="~10% expected under Poisson")
+    c3.metric("🔴 Slow", n_slow)
+    c4.metric("🔵 Fast", n_fast)
 
-    # Historical data
-    fig.add_trace(go.Scatter(
-        x=df["ds"], y=df["y"],
-        mode="lines+markers",
-        name="Historical difficulty",
-        line=dict(color="#f7931a", width=2),
-        marker=dict(size=4),
-    ))
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Observed mean",  f"{mean_obs:.0f} s",
+              delta=f"{mean_obs - MEAN_S:+.0f} s vs 600 s")
+    c6.metric("Observed std",   f"{std_obs:.0f} s",
+              delta=f"{std_obs - STD_S:+.0f} s vs 600 s")
+    c7.metric("KS statistic",   f"{ks_stat:.4f}")
+    c8.metric("KS p-value",     f"{ks_pval:.4f}")
 
-    # Confidence interval (only for forecast region)
-    future_mask = forecast["ds"] > df["ds"].max()
-    fc_future = forecast[future_mask]
-
-    fig.add_trace(go.Scatter(
-        x=pd.concat([fc_future["ds"], fc_future["ds"].iloc[::-1]]),
-        y=pd.concat([fc_future["yhat_upper_actual"],
-                     fc_future["yhat_lower_actual"].iloc[::-1]]),
-        fill="toself",
-        fillcolor="rgba(99,102,241,0.2)",
-        line=dict(color="rgba(255,255,255,0)"),
-        name="90% confidence interval",
-        showlegend=True,
-    ))
-
-    # Forecast line (all periods including fitted)
-    fig.add_trace(go.Scatter(
-        x=forecast["ds"], y=forecast["yhat_actual"],
-        mode="lines",
-        name="Prophet forecast",
-        line=dict(color="#6366f1", width=2, dash="dash"),
-    ))
-
-    # Mark the train/test split
-    split_date = test_df["ds"].min()
-    fig.add_vline(
-        x=split_date.timestamp() * 1000,
-        line_dash="dot", line_color="gray",
-        annotation_text="Train/test split",
-        annotation_position="top left",
-    )
-
-    fig.update_layout(
-        title="Bitcoin Difficulty — Historical + Prophet Forecast",
-        xaxis_title="Date",
-        yaxis_title="Difficulty",
-        yaxis_tickformat=".2s",
-        template="plotly_white",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        hovermode="x unified",
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ------------------------------------------------------------------
-    # Section 2 — Model evaluation
-    # ------------------------------------------------------------------
-    st.subheader("2 · Model evaluation on held-out test set")
-    st.caption(
-        f"The model was trained on all data except the last {N_TEST_PERIODS} "
-        f"adjustment periods, which were used exclusively for evaluation."
-    )
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("MAE", f"{mae/1e12:.2f} T",
-                help="Mean Absolute Error — average prediction error in difficulty units")
-    col2.metric("MAPE", f"{mape:.1f}%",
-                help="Mean Absolute Percentage Error — average % prediction error")
-    col3.metric("Test periods", str(N_TEST_PERIODS))
-
-    # Interpretation
-    if mape < 5:
-        quality = "🟢 Excellent"
-        explanation = "The model predicts difficulty within 5% on average — strong performance for a time-series forecast."
-    elif mape < 10:
-        quality = "🟡 Good"
-        explanation = "The model predicts difficulty within 10% on average — acceptable for planning purposes."
+    if ks_pval < 0.05:
+        st.warning(
+            f"⚠️ **KS p-value = {ks_pval:.4f} < 0.05** — the observed distribution "
+            f"significantly deviates from Exp(1/600). Possible mining pool coordination "
+            f"or recent hashrate event."
+        )
     else:
-        quality = "🟠 Moderate"
-        explanation = "Prediction error exceeds 10% — likely due to a hashrate shock during the test period."
+        st.success(
+            f"✅ **KS p-value = {ks_pval:.4f} ≥ 0.05** — block arrivals are consistent "
+            f"with the theoretical Poisson process."
+        )
 
-    st.info(f"**{quality}** — {explanation}")
+    # ------------------------------------------------------------------
+    # Section 2 — Timeline
+    # ------------------------------------------------------------------
+    st.subheader("2 · Interval timeline")
+    st.caption("Red = slow anomaly  |  Blue = fast anomaly  |  Green = normal")
 
-    # Predicted vs actual chart for test set
-    fig_eval = go.Figure()
+    color_map = {"🔴 SLOW": "#ef4444", "🔵 FAST": "#3b82f6", "🟢 NORMAL": "#22c55e"}
+    colors = [color_map[l] for l in labels]
 
-    fig_eval.add_trace(go.Scatter(
-        x=result["test_dates"],
-        y=[v / 1e12 for v in result["test_real"]],
-        mode="lines+markers",
-        name="Actual difficulty (T)",
-        line=dict(color="#f7931a", width=2),
-        marker=dict(size=8),
+    fig_t = go.Figure()
+    fig_t.add_trace(go.Bar(
+        x=list(range(n)),
+        y=[iv / 60 for iv in ivf],
+        marker_color=colors,
+        hovertemplate="Block %{x}<br>%{y:.1f} min<extra></extra>",
     ))
+    fig_t.add_hline(y=THRESHOLD_HIGH_S / 60, line_dash="dash",
+                    line_color="#ef4444",
+                    annotation_text=f"Slow threshold ({THRESHOLD_HIGH_S/60:.0f} min)")
+    fig_t.add_hline(y=THRESHOLD_LOW_S / 60, line_dash="dash",
+                    line_color="#3b82f6",
+                    annotation_text=f"Fast threshold ({THRESHOLD_LOW_S/60:.1f} min)")
+    fig_t.add_hline(y=10, line_dash="dot", line_color="gray",
+                    annotation_text="Target 10 min")
+    fig_t.update_layout(
+        xaxis_title="Block index (0 = most recent)",
+        yaxis_title="Interval (minutes)",
+        template="plotly_white", showlegend=False,
+    )
+    st.plotly_chart(fig_t, use_container_width=True)
 
-    fig_eval.add_trace(go.Scatter(
-        x=result["test_dates"],
-        y=[v / 1e12 for v in result["test_pred"]],
-        mode="lines+markers",
-        name="Prophet prediction (T)",
+    # ------------------------------------------------------------------
+    # Section 3 — Distribution vs theoretical
+    # ------------------------------------------------------------------
+    st.subheader("3 · Observed distribution vs Exp(1/600)")
+
+    max_iv   = max(ivf)
+    bin_w    = max_iv / 25
+    x_range  = np.linspace(0, max_iv * 1.05, 300)
+    pdf_vals = [exp_pdf_scaled(x, n, bin_w) for x in x_range]
+
+    fig_d = go.Figure()
+    fig_d.add_trace(go.Histogram(
+        x=[iv / 60 for iv in ivf], nbinsx=25,
+        name="Observed", marker_color="#f7931a", opacity=0.75,
+    ))
+    fig_d.add_trace(go.Scatter(
+        x=[x / 60 for x in x_range], y=pdf_vals,
+        mode="lines", name="Exp(λ=1/10 min) theoretical",
         line=dict(color="#6366f1", width=2, dash="dash"),
-        marker=dict(size=8, symbol="diamond"),
     ))
-
-    fig_eval.update_layout(
-        title=f"Actual vs Predicted — last {N_TEST_PERIODS} adjustment periods",
-        xaxis_title="Date",
-        yaxis_title="Difficulty (T)",
+    fig_d.add_vline(x=THRESHOLD_HIGH_S / 60, line_dash="dash",
+                    line_color="#ef4444", annotation_text="Slow threshold")
+    fig_d.add_vline(x=THRESHOLD_LOW_S / 60, line_dash="dash",
+                    line_color="#3b82f6", annotation_text="Fast threshold")
+    fig_d.update_layout(
+        xaxis_title="Time between blocks (minutes)",
+        yaxis_title="Count",
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
     )
-    st.plotly_chart(fig_eval, use_container_width=True)
+    st.plotly_chart(fig_d, use_container_width=True)
 
     # ------------------------------------------------------------------
-    # Section 3 — Next adjustment predictions table
+    # Section 4 — Anomaly table
     # ------------------------------------------------------------------
-    st.subheader("3 · Predicted next difficulty adjustments")
+    st.subheader("4 · Detected anomalies")
 
-    future_forecasts = forecast[forecast["ds"] > df["ds"].max()].head(N_FORECAST_PERIODS)
+    anom_rows = [
+        {
+            "Block index":    i,
+            "Interval (s)":   f"{iv:.0f}",
+            "Interval (min)": f"{iv/60:.1f}",
+            "Type":           lbl,
+            "Percentile":     f"{exp_cdf(iv)*100:.1f}%",
+        }
+        for i, (iv, lbl) in enumerate(zip(ivf, labels))
+        if lbl != "🟢 NORMAL"
+    ]
 
-    table_rows = []
-    for _, row in future_forecasts.iterrows():
-        table_rows.append({
-            "Predicted date":       row["ds"].strftime("%Y-%m-%d"),
-            "Predicted difficulty": f"{row['yhat_actual']/1e12:.2f} T",
-            "Lower bound (90%)":    f"{row['yhat_lower_actual']/1e12:.2f} T",
-            "Upper bound (90%)":    f"{row['yhat_upper_actual']/1e12:.2f} T",
-        })
-
-    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
-
-    st.caption(
-        "Bounds represent the 90% confidence interval — there is a 90% probability "
-        "the actual difficulty will fall within these bounds, assuming no structural "
-        "break in the hashrate trend."
-    )
+    if anom_rows:
+        st.dataframe(pd.DataFrame(anom_rows),
+                     use_container_width=True, hide_index=True)
+        st.caption(
+            f"{len(anom_rows)} anomalies in {n} intervals ({anom_pct:.1f}%). "
+            f"Under a pure Poisson process, ~10% is expected by chance."
+        )
+    else:
+        st.success("No anomalies detected in this sample.")
 
     # ------------------------------------------------------------------
-    # Refresh button
+    # Refresh
     # ------------------------------------------------------------------
     st.divider()
     if st.button("🔄 Refresh now", key="m4_refresh"):
