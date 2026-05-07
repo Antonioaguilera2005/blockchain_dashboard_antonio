@@ -7,7 +7,7 @@
 | Student Name | Antonio Aguilera Slavcheva |
 | GitHub Username | Antonioaguilera2005 |
 | Project Title | Blockchain_dashboard_Antonio |
-| Chosen AI Approach | Difficulty Predictor using Facebook Prophet |
+| Chosen AI Approach | Block Arrival Anomaly Detector (Exponential baseline + KS test) |
 
 ## Module Tracking
 
@@ -16,39 +16,45 @@
 | M1 | Proof of Work Monitor | Done |
 | M2 | Block Header Analyzer | Done |
 | M3 | Difficulty History | Done |
-| M4 | AI Component — Difficulty Predictor (Prophet) | Done |
-| M5 | Merkle Proof Verifier | Not started |
-| M6 | Security Score — 51% attack cost | Not started |
-| M7 | Second AI approach | Not started |
+| M4 | AI Component — Block Arrival Anomaly Detector | Done |
+| M5 | Merkle Proof Verifier | Done |
+| M6 | Security Score — 51% attack cost | In progress |
+| M7 | Fee Estimator (second AI approach) | Not started |
 | M8 | On-chain conversational agent (Anthropic API) | Not started |
 
 ## Current Progress
 
-- M1 complete: live difficulty, hash rate (948 EH/s), inter-block time distribution with exponential curve overlay, and 256-bit SHA-256 space visualisation. Data from blockchain.info.
-- M2 complete: full 80-byte header parsing in little-endian, local SHA256d verification with hashlib confirming hash < target, and compact `bits` field decoded step by step.
-- M3 complete: 3-year difficulty history from mempool.space, adjustment events marked in red/green, block time ratio per period, and summary statistics (51 up / 28 down adjustments over the dataset).
-- M4 complete: Facebook Prophet model trained on ~78 adjustment periods. Evaluated on a held-out test set of 10 periods. MAPE = 24% — the model correctly captured the long-term upward trend but underestimated the hashrate correction of early 2026, which is consistent with the documented limitations of trend-only time-series models.
+- M1 complete: live difficulty, hash rate (948 EH/s), inter-block time distribution with exponential curve overlay, and 256-bit SHA-256 space visualisation.
+- M2 complete: full 80-byte header parsed in little-endian, local SHA256d verification with hashlib confirming hash < target, compact `bits` field decoded step by step.
+- M3 complete: 3-year difficulty history from mempool.space, adjustment events marked red/green, block time ratio per period, summary statistics (51 up / 28 down adjustments).
+- M4 complete: statistical anomaly detector using Exponential(λ=1/600) as theoretical baseline. KS test evaluates deviation from Poisson process. Anomaly rate ~10% expected under null hypothesis. Adjustable slider for 50–200 blocks.
+- M5 complete: Merkle proof fetched from Blockstream, verified step by step with hashlib SHA256d. 13 levels for a 4,743-tx block → 448 bytes proof vs 151,776 bytes full list (99.7% saving). SPV efficiency demonstrated.
 
 ## M4 Model Notes
 
-**Model**: Facebook Prophet (Taylor & Letham, 2017)
+**Model**: Statistical Anomaly Detection — Exponential(λ = 1/600 s⁻¹) baseline
 
-**Why Prophet**: Bitcoin difficulty has a clear upward trend with irregular changepoints. Prophet handles these automatically without manual feature engineering. The ~14-day adjustment period makes the series regular and well-suited for time-series forecasting. Unlike LSTM, Prophet requires no hyperparameter tuning and trains in seconds on a small dataset.
+**Why this approach**: Bitcoin's Proof-of-Work produces a Poisson process for block arrivals, making the Exponential distribution the theoretically correct null model from the course notes. Any deviation is statistically testable and directly connected to the material on hash functions and mining.
 
-**Evaluation**: The model was trained on all data except the last 10 adjustment periods (held-out test set). MAE = 33T, MAPE = 24%. The prediction error is explained by a series of downward difficulty adjustments between January and May 2026 — a hashrate shock the model could not anticipate without hashrate as an external feature. This illustrates the fundamental limitation of purely autoregressive models for assets with volatile fundamentals.
+**Thresholds**: two-tailed 5% per tail — blocks faster than 31 s or slower than 1797 s (30 min) are flagged as anomalies.
 
-**Limitations**:
-- Assumes future resembles the past. A sudden hashrate shock causes large prediction errors.
-- Small dataset (~80 points). Uncertainty grows quickly beyond 3–4 forecast periods.
-- Predicts difficulty value, not direction of change — the latter would require modelling hashrate directly.
+**Evaluation**: KS test statistic and p-value. Anomaly rate ~10% under null hypothesis. Typical results: p-value ≥ 0.05, confirming block arrivals are consistent with a Poisson process.
+
+**Limitations**: small samples (~100 blocks ≈ 17 hours) may not capture rare network events. The detector flags statistical outliers but cannot distinguish natural variance from genuine mining pool behaviour without additional on-chain data.
+
+## Technical Notes
+
+- `blockchain_client.py`: shared API layer for M1–M8. Uses blockchain.info for block data, mempool.space for difficulty history and block timestamp pages (15 blocks/request → ~12× faster), and Blockstream for Merkle proofs.
+- All modules expose a `render()` function consumed by `app.py` via Streamlit tabs.
+- In-memory TTL cache prevents repeated API calls on Streamlit rerenders.
 
 ## Next Step
 
-- Implement M5: Merkle Proof Verifier — pick a transaction from the latest block and verify its inclusion step by step using hashlib.
+- Implement M6: Security Score — estimate the cost in USD/hour of a 51% attack using live hash rate data, and visualise how confirmation depth reduces attack probability (Nakamoto 2008, §11).
 
 ## Main Problem or Blocker
 
-- blockchain.info charts API returns empty responses intermittently. Solved by switching difficulty history to mempool.space `/api/v1/mining/difficulty-adjustments/3y`.
+- No current blockers. Previous issues resolved: blockchain.info charts API → switched to mempool.space. Block timestamp fetch latency → solved with paged API (~12× faster).
 
 ## How to Run
 
@@ -72,9 +78,9 @@ blockchain_dashboard_antonio/
     |-- m2_block_header.py
     |-- m3_difficulty_history.py
     |-- m4_ai_component.py
-    |-- m5_merkle_verifier.py      (coming)
-    |-- m6_security_score.py       (coming)
-    |-- m7_second_ai.py            (coming)
+    |-- m5_merkle_verifier.py
+    |-- m6_security_score.py       (in progress)
+    |-- m7_fee_estimator.py        (coming)
     `-- m8_onchain_agent.py        (coming)
 ```
 
